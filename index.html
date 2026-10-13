@@ -1403,9 +1403,7 @@ try {
     for (const [id,val] of local) {
       if (!base.has(id) || !same(val,base.get(id))) pushSet(ops, doc(db,name,id), val, base.get(id), base.has(id));
     }
-    for (const [id,val] of base) {
-      if (!local.has(id)) pushDelete(ops, doc(db,name,id), val);
-    }
+    // SAFETY: do not infer deletion from a missing local snapshot entry.
   }
 
   function diffNestedAvailability(localObj, baseObj, ops) {
@@ -1417,12 +1415,7 @@ try {
         pushSet(ops, doc(db,"availability",personId,"dates",date), {...clone(val),personId,date}, base.has(key) ? {...clone(base.get(key)),personId,date} : undefined, base.has(key));
       }
     }
-    for (const [key,val] of base) {
-      if (!local.has(key)) {
-        const [personId,date] = splitKey(key);
-        pushDelete(ops, doc(db,"availability",personId,"dates",date), {...clone(val),personId,date});
-      }
-    }
+    // SAFETY: do not infer deletion from a missing local snapshot entry.
   }
 
   function diffNestedEventAvailability(localObj, baseObj, ops) {
@@ -1438,13 +1431,7 @@ try {
         pushSet(ops, doc(db,"eventAvailability",personId,"events",eventId), body, baseBody, base.has(key));
       }
     }
-    for (const [key,val] of base) {
-      if (!local.has(key)) {
-        const [personId,eventId] = splitKey(key);
-        const baseBody = (val && typeof val === "object" && !Array.isArray(val)) ? {...clone(val),personId,eventId} : {value:clone(val),personId,eventId};
-        pushDelete(ops, doc(db,"eventAvailability",personId,"events",eventId), baseBody);
-      }
-    }
+    // SAFETY: do not infer deletion from a missing local snapshot entry.
   }
 
   // Three-way merge: only fields changed locally are candidates for writing.
