@@ -356,7 +356,7 @@ function normalizeData(v){
 let data=normalizeData(loadLocal());
 function loadLocal(){try{return JSON.parse(localStorage.getItem(STORAGE_KEY)||'null')}catch(e){return null}}
 function saveLocal(){localStorage.setItem(STORAGE_KEY,JSON.stringify(data))}
-function persist(){pruneIrrelevantAvailabilityAlerts();data.alerts=dedupeAlerts(data.alerts);saveLocal();applyTheme();if(window.OpsCloud?.ready)window.OpsCloud.save(data).catch(console.error);else window.__OPS_PENDING=data}
+function persist(){pruneIrrelevantAvailabilityAlerts();data.alerts=dedupeAlerts(data.alerts);saveLocal();applyTheme();if(window.OpsCloud?.ready)window.OpsCloud.save(data).catch(console.error);else console.warn('Firestore 초기 로딩 전 저장은 서버로 전송하지 않았습니다. 연결 완료 후 다시 시도하세요.')}
 window.__OPS_getData=()=>JSON.parse(JSON.stringify(data));
 window.__OPS_applyRemote=(remote)=>{data=normalizeData(remote);saveLocal();applyTheme();renderApp()};
 
@@ -1143,7 +1143,7 @@ import { initializeApp } from "https://www.gstatic.com/firebasejs/12.17.1/fireba
 import { getAuth, signInAnonymously, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/12.17.1/firebase-auth.js";
 import {
   getFirestore, collection, collectionGroup, doc, getDoc, getDocs,
-  onSnapshot, writeBatch
+  onSnapshot, writeBatch, runTransaction
 } from "https://www.gstatic.com/firebasejs/12.17.1/firebase-firestore.js";
 
 /*
@@ -1161,6 +1161,13 @@ const firebaseConfig = {
   appId: "1:940926681678:web:2297cc898d9f6de123b91f"
 };
 
+// Block edits until Firestore's authoritative initial state has loaded.
+const startupGate = document.createElement('div');
+startupGate.id = 'ops-cloud-startup-gate';
+startupGate.style.cssText = 'position:fixed;inset:0;z-index:2147483647;background:#111827;color:#fff;display:flex;align-items:center;justify-content:center;padding:24px;text-align:center;font:16px/1.5 system-ui,sans-serif;';
+startupGate.innerHTML = '<div><div style="font-size:20px;font-weight:700;margin-bottom:8px">바람플레이 데이터 확인 중</div><div id="ops-cloud-startup-message">클라우드 데이터를 불러오는 중입니다. 데이터 보호를 위해 잠시 편집이 잠깁니다.</div></div>';
+document.body.appendChild(startupGate);
+
 const TOP_COLLECTIONS = [
   "people", "works", "events", "alerts",
   "availabilityHistory", "notices", "maintenanceRequests"
@@ -1171,6 +1178,7 @@ window.OpsCloud = {
   status: "connecting",
   schemaVersion: 2
 };
+window.OpsCloud.getConflictBackup = () => { try { return JSON.parse(localStorage.getItem('baramPlaySyncConflictsV1') || '[]'); } catch (_) { return []; } };
 
 const clone = v => JSON.parse(JSON.stringify(v ?? null));
 const canonical = v => {
@@ -1381,17 +1389,21 @@ try {
     window.OpsCloud.status = "error";
   }
 
-  function pushSet(ops, ref, value) { ops.push({kind:"set",ref,value:clone(value)}); }
-  function pushDelete(ops, ref) { ops.push({kind:"delete",ref}); }
+  function pushSet(ops, ref, value, baseValue, hasBase) {
+    ops.push({kind:"set",ref,value:clone(value),baseValue:clone(baseValue),hasBase:!!hasBase});
+  }
+  function pushDelete(ops, ref, baseValue) {
+    ops.push({kind:"delete",ref,baseValue:clone(baseValue),hasBase:true});
+  }
 
   function diffIdCollection(name, localItems, baseItems, ops) {
     const local = indexById(localItems || []);
     const base = indexById(baseItems || []);
     for (const [id,val] of local) {
-      if (!base.has(id) || !same(val,base.get(id))) pushSet(ops, doc(db,name,id), val);
+      if (!base.has(id) || !same(val,base.get(id))) pushSet(ops, doc(db,name,id), val, base.get(id), base.has(id));
     }
-    for (const id of base.keys()) {
-      if (!local.has(id)) pushDelete(ops, doc(db,name,id));
+    for (const [id,val] of base) {
+      if (!local.has(id)) pushDelete(ops, doc(db,name,id), val);
     }
   }
 
@@ -1401,13 +1413,13 @@ try {
     for (const [key,val] of local) {
       if (!base.has(key) || !same(val,base.get(key))) {
         const [personId,date] = splitKey(key);
-        pushSet(ops, doc(db,"availability",personId,"dates",date), {...clone(val),personId,date});
+        pushSet(ops, doc(db,"availability",personId,"dates",date), {...clone(val),personId,date}, base.has(key) ? {...clone(base.get(key)),personId,date} : undefined, base.has(key));
       }
     }
-    for (const key of base.keys()) {
+    for (const [key,val] of base) {
       if (!local.has(key)) {
         const [personId,date] = splitKey(key);
-        pushDelete(ops, doc(db,"availability",personId,"dates",date));
+        pushDelete(ops, doc(db,"availability",personId,"dates",date), {...clone(val),personId,date});
       }
     }
   }
@@ -1421,91 +1433,171 @@ try {
         const body = (val && typeof val === "object" && !Array.isArray(val))
           ? {...clone(val),personId,eventId}
           : {value:clone(val),personId,eventId};
-        pushSet(ops, doc(db,"eventAvailability",personId,"events",eventId), body);
+        const baseBody = base.has(key) ? ((base.get(key) && typeof base.get(key)==="object" && !Array.isArray(base.get(key))) ? {...clone(base.get(key)),personId,eventId} : {value:clone(base.get(key)),personId,eventId}) : undefined;
+        pushSet(ops, doc(db,"eventAvailability",personId,"events",eventId), body, baseBody, base.has(key));
       }
     }
-    for (const key of base.keys()) {
+    for (const [key,val] of base) {
       if (!local.has(key)) {
         const [personId,eventId] = splitKey(key);
-        pushDelete(ops, doc(db,"eventAvailability",personId,"events",eventId));
+        const baseBody = (val && typeof val === "object" && !Array.isArray(val)) ? {...clone(val),personId,eventId} : {value:clone(val),personId,eventId};
+        pushDelete(ops, doc(db,"eventAvailability",personId,"events",eventId), baseBody);
       }
     }
+  }
+
+  // Three-way merge: only fields changed locally are candidates for writing.
+  // If both clients changed the same field differently, keep the server value and
+  // save the local conflicting value in a durable browser-side recovery log.
+  const MISSING = {__baram_missing_sentinel__: true};
+  function isMissing(v) { return v === MISSING || (v && v.__baram_missing_sentinel__ === true); }
+  function merge3(base, local, remote, path, conflicts) {
+    if (same(local, base)) return clone(remote);
+    if (same(remote, base)) return clone(local);
+    if (same(local, remote)) return clone(local);
+    const localObj = local && typeof local === 'object' && !Array.isArray(local);
+    const remoteObj = remote && typeof remote === 'object' && !Array.isArray(remote);
+    const baseObj = base && typeof base === 'object' && !Array.isArray(base);
+    if ((localObj || isMissing(local)) && (remoteObj || isMissing(remote)) && (baseObj || isMissing(base))) {
+      const out = {};
+      const keys = new Set([
+        ...(baseObj ? Object.keys(base) : []),
+        ...(localObj ? Object.keys(local) : []),
+        ...(remoteObj ? Object.keys(remote) : [])
+      ]);
+      for (const k of keys) {
+        const b = baseObj && Object.prototype.hasOwnProperty.call(base,k) ? base[k] : MISSING;
+        const l = localObj && Object.prototype.hasOwnProperty.call(local,k) ? local[k] : MISSING;
+        const r = remoteObj && Object.prototype.hasOwnProperty.call(remote,k) ? remote[k] : MISSING;
+        const v = merge3(b,l,r, path ? `${path}.${k}` : k, conflicts);
+        if (!isMissing(v)) out[k] = v;
+      }
+      return out;
+    }
+    conflicts.push({path, local: isMissing(local) ? {deleted:true} : clone(local), remote: isMissing(remote) ? {deleted:true} : clone(remote), base: isMissing(base) ? {missing:true} : clone(base)});
+    return isMissing(remote) ? clone(local) : clone(remote);
+  }
+
+  function recordConflicts(conflicts, refPath) {
+    if (!conflicts.length) return;
+    let existing=[];
+    try { existing=JSON.parse(localStorage.getItem('baramPlaySyncConflictsV1')||'[]'); if(!Array.isArray(existing)) existing=[]; } catch (_) { existing=[]; }
+    const entry={id:`${Date.now()}-${Math.random().toString(36).slice(2,9)}`,at:new Date().toISOString(),document:refPath,conflicts:clone(conflicts)};
+    existing.push(entry);
+    if(existing.length>100) existing=existing.slice(-100);
+    try { localStorage.setItem('baramPlaySyncConflictsV1',JSON.stringify(existing)); } catch(e) { console.error('충돌 백업을 브라우저에 기록하지 못했습니다.',e); }
+    window.__OPS_SYNC_CONFLICTS=existing;
+    window.OpsCloud.status='conflict';
+    console.warn('동시 수정 충돌을 발견했습니다. 서버 값을 유지하고 로컬 변경은 baramPlaySyncConflictsV1 백업에 보관했습니다.',entry);
+  }
+
+  function cleanForMerge(value, pathType) {
+    const v=clone(value);
+    if(v && typeof v==='object' && !Array.isArray(v)) {
+      if(pathType==='availability') { delete v.personId; delete v.date; }
+      if(pathType==='eventAvailability') { delete v.personId; delete v.eventId; if(Object.keys(v).length===1 && Object.prototype.hasOwnProperty.call(v,'value')) return v.value; }
+    }
+    return v;
   }
 
   async function commitOps(ops) {
-    for (let i=0;i<ops.length;i+=400) {
-      const part = ops.slice(i,i+400);
-      const batch = writeBatch(db);
-      for (const op of part) {
-        if (op.kind === "delete") batch.delete(op.ref);
-        else batch.set(op.ref, op.value);
-      }
-      await batch.commit();
+    // Per-document transactions prevent stale snapshots from blindly replacing
+    // documents that another browser has changed since this client last read them.
+    for (const op of ops) {
+      await runTransaction(db, async tx => {
+        const snap = await tx.get(op.ref);
+        const remote = snap.exists() ? (snap.data() || {}) : MISSING;
+        const base = op.hasBase ? op.baseValue : MISSING;
+        if (op.kind === 'delete') {
+          if (isMissing(remote)) return;
+          if (same(remote,base)) tx.delete(op.ref);
+          else recordConflicts([{path:'$document',local:{deleted:true},remote:clone(remote),base:clone(base)}],op.ref.path);
+          return;
+        }
+        const conflicts=[];
+        let merged;
+        if (isMissing(remote)) {
+          if (!op.hasBase) merged=clone(op.value);
+          else {
+            // Remote deletion raced with a local edit: preserve the local record,
+            // while retaining a conflict copy for later review.
+            conflicts.push({path:'$document',local:clone(op.value),remote:{deleted:true},base:clone(base)});
+            merged=clone(op.value);
+          }
+        } else if (!op.hasBase) {
+          if (same(remote,op.value)) merged=clone(remote);
+          else {
+            merged=merge3(MISSING,op.value,remote,'$',conflicts);
+          }
+        } else {
+          merged=merge3(base,op.value,remote,'$',conflicts);
+        }
+        if (!same(merged,remote)) tx.set(op.ref,merged);
+        if (conflicts.length) recordConflicts(conflicts,op.ref.path);
+      });
     }
   }
 
-  window.OpsCloud.save = async payload => {
+  let saveQueue = Promise.resolve();
+  window.OpsCloud.save = payload => {
     if (!window.OpsCloud.ready || applying) {
-      window.__OPS_PENDING = clone(payload);
-      return;
+      // Never replay a pre-load full snapshot over the authoritative Firestore state.
+      return Promise.resolve();
     }
     const local = clone(payload || {});
     const base = clone(lastSynced || composeRemoteData());
-    const ops = [];
-
-    const localSettings = {
-      orgName: local.orgName || "",
-      orgSub: local.orgSub || "",
-      entryCode: local.entryCode || "",
-      adminCode: local.adminCode || "",
-      securityCode: local.securityCode || "",
-      theme: clone(local.theme || {}),
-      schemaVersion: 2
+    const runSave = async () => {
+      const ops = [];
+      const localSettings = {
+        orgName: local.orgName || "", orgSub: local.orgSub || "",
+        entryCode: local.entryCode || "", adminCode: local.adminCode || "",
+        securityCode: local.securityCode || "", theme: clone(local.theme || {}), schemaVersion: 2
+      };
+      const baseSettings = {
+        orgName: base.orgName || "", orgSub: base.orgSub || "",
+        entryCode: base.entryCode || "", adminCode: base.adminCode || "",
+        securityCode: base.securityCode || "", theme: clone(base.theme || {}), schemaVersion: 2
+      };
+      if (!same(localSettings, baseSettings)) pushSet(ops, doc(db,"settings","main"), localSettings, baseSettings, true);
+      for (const name of TOP_COLLECTIONS) diffIdCollection(name, local[name], base[name], ops);
+      diffNestedAvailability(local.availability, base.availability, ops);
+      diffNestedEventAvailability(local.eventAvailability, base.eventAvailability, ops);
+      if (!ops.length) return;
+      saveDepth++;
+      try {
+        await commitOps(ops);
+        if (window.OpsCloud.status !== 'conflict') window.OpsCloud.status = 'connected';
+      } catch (err) {
+        console.error("Firestore save failed", err);
+        window.OpsCloud.status = "save-error";
+        throw err;
+      } finally {
+        saveDepth--;
+        scheduleRemoteApply();
+      }
     };
-    const baseSettings = {
-      orgName: base.orgName || "",
-      orgSub: base.orgSub || "",
-      entryCode: base.entryCode || "",
-      adminCode: base.adminCode || "",
-      securityCode: base.securityCode || "",
-      theme: clone(base.theme || {}),
-      schemaVersion: 2
-    };
-    if (!same(localSettings, baseSettings)) pushSet(ops, doc(db,"settings","main"), localSettings);
-
-    for (const name of TOP_COLLECTIONS) diffIdCollection(name, local[name], base[name], ops);
-    diffNestedAvailability(local.availability, base.availability, ops);
-    diffNestedEventAvailability(local.eventAvailability, base.eventAvailability, ops);
-
-    if (!ops.length) return;
-
-    saveDepth++;
-    try {
-      await commitOps(ops);
-      window.OpsCloud.status = "connected";
-    } catch (err) {
-      console.error("Firestore save failed", err);
-      window.OpsCloud.status = "save-error";
-      throw err;
-    } finally {
-      saveDepth--;
-      scheduleRemoteApply();
-    }
+    const result = saveQueue.then(runSave, runSave);
+    saveQueue = result.catch(err => console.error('Firestore save queue recovered after error',err));
+    return result;
   };
 
   async function start(user) {
     if (!user || started) return;
     started = true;
     window.OpsCloud.status = "loading";
-    await loadInitial();
-    subscribeAll();
-    window.OpsCloud.ready = true;
-    window.OpsCloud.status = "connected";
-
-    if (window.__OPS_PENDING) {
-      const p = window.__OPS_PENDING;
-      window.__OPS_PENDING = null;
-      await window.OpsCloud.save(p);
+    try {
+      await loadInitial();
+      subscribeAll();
+      window.OpsCloud.ready = true;
+      window.OpsCloud.status = "connected";
+      const gate=document.getElementById('ops-cloud-startup-gate');
+      if(gate) gate.remove();
+    } catch(err) {
+      window.OpsCloud.ready = false;
+      window.OpsCloud.status = "error";
+      const msg=document.getElementById('ops-cloud-startup-message');
+      if(msg) msg.textContent='클라우드 연결에 실패했습니다. 데이터 보호를 위해 편집을 잠갔습니다. 새로고침 후에도 반복되면 관리자에게 문의하세요.';
+      throw err;
     }
   }
 
@@ -1517,6 +1609,8 @@ try {
     else signInAnonymously(auth).catch(err=>{
       console.error(err);
       window.OpsCloud.status = "auth-error";
+      const msg=document.getElementById("ops-cloud-startup-message");
+      if(msg) msg.textContent="로그인/클라우드 연결에 실패했습니다. 데이터 보호를 위해 편집을 잠갔습니다. 새로고침 후에도 반복되면 관리자에게 문의하세요.";
     });
   });
 
