@@ -1226,6 +1226,7 @@ try {
 
   let applying = false;
   let saveDepth = 0;
+  let pendingSaveCount = 0;
   let remoteTimer = null;
   let lastSynced = null;
   let started = false;
@@ -1290,7 +1291,7 @@ try {
   function scheduleRemoteApply() {
     clearTimeout(remoteTimer);
     remoteTimer = setTimeout(()=>{
-      if (saveDepth > 0) return scheduleRemoteApply();
+      if (saveDepth > 0 || pendingSaveCount > 0) return scheduleRemoteApply();
       const remote = composeRemoteData();
       lastSynced = clone(remote);
       applying = true;
@@ -1576,7 +1577,19 @@ try {
         scheduleRemoteApply();
       }
     };
-    const result = saveQueue.then(runSave, runSave);
+    // Keep realtime snapshots from replacing local UI/localStorage while a save is
+    // queued or running. Otherwise a remote update can erase a just-edited local
+    // state before its queued transaction starts.
+    pendingSaveCount++;
+    const executeSave = async () => {
+      try {
+        return await runSave();
+      } finally {
+        pendingSaveCount = Math.max(0, pendingSaveCount - 1);
+        if (pendingSaveCount === 0) scheduleRemoteApply();
+      }
+    };
+    const result = saveQueue.then(executeSave, executeSave);
     saveQueue = result.catch(err => console.error('Firestore save queue recovered after error',err));
     return result;
   };
